@@ -298,7 +298,7 @@ func (s *Server) start() (reterr error) {
 		return fmt.Errorf("netstack.Create: %w", err)
 	}
 	ns.ProcessLocalIPs = true
-	ns.ForwardTCPIn = s.forwardTCP
+	ns.ProcessSubnets = true
 	if err := ns.Start(); err != nil {
 		return fmt.Errorf("failed to start netstack: %w", err)
 	}
