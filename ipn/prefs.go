@@ -477,6 +477,9 @@ func (p *Prefs) ControlURLOrDefault() string {
 }
 
 // AdminPageURL returns the admin web site URL for the current ControlURL.
+func (p PrefsView) AdminPageURL() string { return p.ж.AdminPageURL() }
+
+// AdminPageURL returns the admin web site URL for the current ControlURL.
 func (p *Prefs) AdminPageURL() string {
 	url := p.ControlURLOrDefault()
 	if IsLoginServerSynonym(url) {
@@ -485,6 +488,10 @@ func (p *Prefs) AdminPageURL() string {
 	}
 	return url + "/admin/machines"
 }
+
+// AdvertisesExitNode reports whether p is advertising both the v4 and
+// v6 /0 exit node routes.
+func (p PrefsView) AdvertisesExitNode() bool { return p.ж.AdvertisesExitNode() }
 
 // AdvertisesExitNode reports whether p is advertising both the v4 and
 // v6 /0 exit node routes.
@@ -680,4 +687,22 @@ func SavePrefs(filename string, p *Prefs) {
 	if err := atomicfile.WriteFile(filename, data, 0600); err != nil {
 		log.Printf("SavePrefs: %v\n", err)
 	}
+}
+
+// ProfileID is an auto-generated system-wide unique identifier for a login
+// profile. It is a 4 character hex string like "1ab3".
+type ProfileID string
+
+// LoginProfile represents a single login profile as managed
+// by the ProfileManager.
+type LoginProfile struct {
+	ID   ProfileID
+	Name string
+	Key  StateKey
+
+	UserProfile tailcfg.UserProfile
+
+	// LocalUserID is the user ID of the user who created this profile.
+	// It is only relevant on Windows where we have a multi-user system.
+	LocalUserID string
 }

@@ -25,6 +25,7 @@ import (
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	qrcode "github.com/skip2/go-qrcode"
+	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
@@ -259,6 +260,9 @@ func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]
 	if advertiseDefaultRoute {
 		routeMap[netip.MustParsePrefix("0.0.0.0/0")] = true
 		routeMap[netip.MustParsePrefix("::/0")] = true
+	}
+	if len(routeMap) == 0 {
+		return nil, nil
 	}
 	routes := make([]netip.Prefix, 0, len(routeMap))
 	for r := range routeMap {
@@ -495,7 +499,7 @@ func runUp(ctx context.Context, args []string) (retErr error) {
 
 	defer func() {
 		if retErr == nil {
-			checkSSHUpWarnings(ctx)
+			checkUpWarnings(ctx)
 		}
 	}()
 
@@ -634,27 +638,10 @@ func runUp(ctx context.Context, args []string) (retErr error) {
 		if err != nil {
 			return err
 		}
-		opts := ipn.Options{
-			StateKey:    ipn.GlobalDaemonStateKey,
+		bc.Start(ipn.Options{
 			AuthKey:     authKey,
 			UpdatePrefs: prefs,
-		}
-		// On Windows, we still run in mostly the "legacy" way that
-		// predated the server's StateStore. That is, we send an empty
-		// StateKey and send the prefs directly. Although the Windows
-		// supports server mode, though, the transition to StateStore
-		// is only half complete. Only server mode uses it, and the
-		// Windows service (~tailscaled) is the one that computes the
-		// StateKey based on the connection identity. So for now, just
-		// do as the Windows GUI's always done:
-		if effectiveGOOS() == "windows" {
-			// The Windows service will set this as needed based
-			// on our connection's identity.
-			opts.StateKey = ""
-			opts.Prefs = prefs
-		}
-
-		bc.Start(opts)
+		})
 		if upArgs.forceReauth {
 			startLoginInteractive()
 		}
@@ -695,25 +682,39 @@ func runUp(ctx context.Context, args []string) (retErr error) {
 	}
 }
 
-func checkSSHUpWarnings(ctx context.Context) {
-	if !upArgs.runSSH {
-		return
-	}
-	st, err := localClient.Status(ctx)
+// upWorthWarning reports whether the health check message s is worth warning
+// about during "tailscale up". Many of the health checks are noisy or confusing
+// or very ephemeral and happen especially briefly at startup.
+//
+// TODO(bradfitz): change the server to send typed warnings with metadata about
+// the health check, rather than just a string.
+func upWorthyWarning(s string) bool {
+	return strings.Contains(s, healthmsg.TailscaleSSHOnBut) ||
+		strings.Contains(s, healthmsg.WarnAcceptRoutesOff)
+}
+
+func checkUpWarnings(ctx context.Context) {
+	st, err := localClient.StatusWithoutPeers(ctx)
 	if err != nil {
 		// Ignore. Don't spam more.
 		return
 	}
-	if len(st.Health) == 0 {
+	var warn []string
+	for _, w := range st.Health {
+		if upWorthyWarning(w) {
+			warn = append(warn, w)
+		}
+	}
+	if len(warn) == 0 {
 		return
 	}
-	if len(st.Health) == 1 && strings.Contains(st.Health[0], "SSH") {
-		printf("%s\n", st.Health[0])
+	if len(warn) == 1 {
+		printf("%s\n", warn[0])
 		return
 	}
-	printf("# Health check:\n")
-	for _, m := range st.Health {
-		printf("    - %s\n", m)
+	printf("# Health check warnings:\n")
+	for _, m := range warn {
+		printf("#     - %s\n", m)
 	}
 }
 
@@ -1056,4 +1057,16 @@ func exitNodeIP(p *ipn.Prefs, st *ipnstate.Status) (ip netip.Addr) {
 		}
 	}
 	return
+}
+
+func anyPeerAdvertisingRoutes(st *ipnstate.Status) bool {
+	for _, ps := range st.Peer {
+		if ps.PrimaryRoutes == nil {
+			continue
+		}
+		if ps.PrimaryRoutes.Len() > 0 {
+			return true
+		}
+	}
+	return false
 }

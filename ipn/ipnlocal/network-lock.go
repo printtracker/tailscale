@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"tailscale.com/envknob"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
@@ -34,6 +35,7 @@ var (
 )
 
 type tkaState struct {
+	profile   ipn.ProfileID
 	authority *tka.Authority
 	storage   *tka.FS
 }
@@ -96,7 +98,7 @@ func (b *LocalBackend) tkaFilterNetmapLocked(nm *netmap.NetworkMap) {
 //
 // tkaSyncIfNeeded immediately takes b.takeSyncLock which is held throughout,
 // and may take b.mu as required.
-func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap) error {
+func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap, prefs ipn.PrefsView) error {
 	if !envknob.UseWIPCode() {
 		// If the feature flag is not enabled, pretend we don't exist.
 		return nil
@@ -109,7 +111,7 @@ func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap) error {
 	b.mu.Lock() // take mu to protect access to synchronized fields.
 	defer b.mu.Unlock()
 
-	ourNodeKey := b.prefs.Persist().PublicNodeKey()
+	ourNodeKey := prefs.Persist().PublicNodeKey()
 
 	isEnabled := b.tka != nil
 	wantEnabled := nm.TKAEnabled
@@ -250,7 +252,7 @@ func (b *LocalBackend) tkaSyncLocked(ourNodeKey key.NodePublic) error {
 // b.mu must be held & TKA must be initialized.
 func (b *LocalBackend) tkaApplyDisablementLocked(secret []byte) error {
 	if b.tka.authority.ValidDisablement(secret) {
-		if err := os.RemoveAll(b.chonkPath()); err != nil {
+		if err := os.RemoveAll(b.chonkPathLocked()); err != nil {
 			return err
 		}
 		b.tka = nil
@@ -259,10 +261,10 @@ func (b *LocalBackend) tkaApplyDisablementLocked(secret []byte) error {
 	return errors.New("incorrect disablement secret")
 }
 
-// chonkPath returns the absolute path to the directory in which TKA
+// chonkPathLocked returns the absolute path to the directory in which TKA
 // state (the 'tailchonk') is stored.
-func (b *LocalBackend) chonkPath() string {
-	return filepath.Join(b.TailscaleVarRoot(), "tka")
+func (b *LocalBackend) chonkPathLocked() string {
+	return filepath.Join(b.TailscaleVarRoot(), "tka-profiles", string(b.pm.CurrentProfile().ID))
 }
 
 // tkaBootstrapFromGenesisLocked initializes the local (on-disk) state of the
@@ -279,7 +281,10 @@ func (b *LocalBackend) tkaBootstrapFromGenesisLocked(g tkatype.MarshaledAUM) err
 		return fmt.Errorf("reading genesis: %v", err)
 	}
 
-	chonkDir := b.chonkPath()
+	chonkDir := b.chonkPathLocked()
+	if err := os.Mkdir(filepath.Dir(chonkDir), 0755); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("creating chonk root dir: %v", err)
+	}
 	if err := os.Mkdir(chonkDir, 0755); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("mkdir: %v", err)
 	}
@@ -294,6 +299,7 @@ func (b *LocalBackend) tkaBootstrapFromGenesisLocked(g tkatype.MarshaledAUM) err
 	}
 
 	b.tka = &tkaState{
+		profile:   b.pm.CurrentProfile().ID,
 		authority: authority,
 		storage:   chonk,
 	}
@@ -328,10 +334,27 @@ func (b *LocalBackend) NetworkLockStatus() *ipnstate.NetworkLockStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	var (
+		nodeKey *key.NodePublic
+		nlPriv  key.NLPrivate
+	)
+	if p := b.pm.CurrentPrefs(); p.Valid() && p.Persist() != nil && !p.Persist().PrivateNodeKey.IsZero() {
+		nkp := p.Persist().PublicNodeKey()
+		nodeKey = &nkp
+		nlPriv = p.Persist().NetworkLockKey
+	}
+
+	if nlPriv.IsZero() {
+		return &ipnstate.NetworkLockStatus{
+			Enabled: false,
+			NodeKey: nodeKey,
+		}
+	}
 	if b.tka == nil {
 		return &ipnstate.NetworkLockStatus{
 			Enabled:   false,
-			PublicKey: b.nlPrivKey.Public(),
+			NodeKey:   nodeKey,
+			PublicKey: nlPriv.Public(),
 		}
 	}
 
@@ -339,10 +362,28 @@ func (b *LocalBackend) NetworkLockStatus() *ipnstate.NetworkLockStatus {
 	h := b.tka.authority.Head()
 	copy(head[:], h[:])
 
+	var selfAuthorized bool
+	if b.netMap != nil {
+		selfAuthorized = b.tka.authority.NodeKeyAuthorized(b.netMap.SelfNode.Key, b.netMap.SelfNode.KeySignature) == nil
+	}
+
+	keys := b.tka.authority.Keys()
+	outKeys := make([]ipnstate.TKAKey, len(keys))
+	for i, k := range keys {
+		outKeys[i] = ipnstate.TKAKey{
+			Key:      key.NLPublicFromEd25519Unsafe(k.Public),
+			Metadata: k.Meta,
+			Votes:    k.Votes,
+		}
+	}
+
 	return &ipnstate.NetworkLockStatus{
-		Enabled:   true,
-		Head:      &head,
-		PublicKey: b.nlPrivKey.Public(),
+		Enabled:       true,
+		Head:          &head,
+		PublicKey:     nlPriv.Public(),
+		NodeKey:       nodeKey,
+		NodeKeySigned: selfAuthorized,
+		TrustedKeys:   outKeys,
 	}
 }
 
@@ -361,12 +402,14 @@ func (b *LocalBackend) NetworkLockInit(keys []tka.Key, disablementValues [][]byt
 	}
 
 	var ourNodeKey key.NodePublic
+	var nlPriv key.NLPrivate
 	b.mu.Lock()
-	if b.prefs.Valid() {
-		ourNodeKey = b.prefs.Persist().PublicNodeKey()
+	if p := b.pm.CurrentPrefs(); p.Valid() && p.Persist() != nil && !p.Persist().PrivateNodeKey.IsZero() {
+		ourNodeKey = p.Persist().PublicNodeKey()
+		nlPriv = p.Persist().NetworkLockKey
 	}
 	b.mu.Unlock()
-	if ourNodeKey.IsZero() {
+	if ourNodeKey.IsZero() || nlPriv.IsZero() {
 		return errors.New("no node-key: is tailscale logged in?")
 	}
 
@@ -381,7 +424,7 @@ func (b *LocalBackend) NetworkLockInit(keys []tka.Key, disablementValues [][]byt
 		//    - DisablementSecret: value needed to disable.
 		//    - DisablementValue: the KDF of the disablement secret, a public value.
 		DisablementSecrets: disablementValues,
-	}, b.nlPrivKey)
+	}, nlPriv)
 	if err != nil {
 		return fmt.Errorf("tka.Create: %v", err)
 	}
@@ -404,7 +447,7 @@ func (b *LocalBackend) NetworkLockInit(keys []tka.Key, disablementValues [][]byt
 	// satisfy network-lock checks.
 	sigs := make(map[tailcfg.NodeID]tkatype.MarshaledSignature, len(initResp.NeedSignatures))
 	for _, nodeInfo := range initResp.NeedSignatures {
-		nks, err := signNodeKey(nodeInfo, b.nlPrivKey)
+		nks, err := signNodeKey(nodeInfo, nlPriv)
 		if err != nil {
 			return fmt.Errorf("generating signature: %v", err)
 		}
@@ -444,10 +487,18 @@ func (b *LocalBackend) NetworkLockSign(nodeKey key.NodePublic, rotationPublic []
 		b.mu.Lock()
 		defer b.mu.Unlock()
 
+		var nlPriv key.NLPrivate
+		if p := b.pm.CurrentPrefs(); p.Valid() && p.Persist() != nil {
+			nlPriv = p.Persist().NetworkLockKey
+		}
+		if nlPriv.IsZero() {
+			return key.NodePublic{}, tka.NodeKeySignature{}, errMissingNetmap
+		}
+
 		if b.tka == nil {
 			return key.NodePublic{}, tka.NodeKeySignature{}, errNetworkLockNotActive
 		}
-		if !b.tka.authority.KeyTrusted(b.nlPrivKey.KeyID()) {
+		if !b.tka.authority.KeyTrusted(nlPriv.KeyID()) {
 			return key.NodePublic{}, tka.NodeKeySignature{}, errors.New("this node is not trusted by network lock")
 		}
 
@@ -457,15 +508,16 @@ func (b *LocalBackend) NetworkLockSign(nodeKey key.NodePublic, rotationPublic []
 		}
 		sig := tka.NodeKeySignature{
 			SigKind:        tka.SigDirect,
-			KeyID:          b.nlPrivKey.KeyID(),
+			KeyID:          nlPriv.KeyID(),
 			Pubkey:         p,
 			WrappingPubkey: rotationPublic,
 		}
-		sig.Signature, err = b.nlPrivKey.SignNKS(sig.SigHash())
+		sig.Signature, err = nlPriv.SignNKS(sig.SigHash())
 		if err != nil {
 			return key.NodePublic{}, tka.NodeKeySignature{}, fmt.Errorf("signature failed: %w", err)
 		}
-		return b.prefs.Persist().PublicNodeKey(), sig, nil
+
+		return b.pm.CurrentPrefs().Persist().PublicNodeKey(), sig, nil
 	}(nodeKey, rotationPublic)
 	if err != nil {
 		return err
@@ -489,14 +541,29 @@ func (b *LocalBackend) NetworkLockModify(addKeys, removeKeys []tka.Key) (err err
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	var ourNodeKey key.NodePublic
+	if p := b.pm.CurrentPrefs(); p.Valid() && p.Persist() != nil && !p.Persist().PrivateNodeKey.IsZero() {
+		ourNodeKey = p.Persist().PublicNodeKey()
+	}
+	if ourNodeKey.IsZero() {
+		return errors.New("no node-key: is tailscale logged in?")
+	}
+
 	if err := b.CanSupportNetworkLock(); err != nil {
 		return err
+	}
+	var nlPriv key.NLPrivate
+	if p := b.pm.CurrentPrefs(); p.Valid() && p.Persist() != nil {
+		nlPriv = p.Persist().NetworkLockKey
+	}
+	if nlPriv.IsZero() {
+		return errMissingNetmap
 	}
 	if b.tka == nil {
 		return errNetworkLockNotActive
 	}
 
-	updater := b.tka.authority.NewUpdater(b.nlPrivKey)
+	updater := b.tka.authority.NewUpdater(nlPriv)
 
 	for _, addKey := range addKeys {
 		if err := updater.AddKey(addKey); err != nil {
@@ -518,7 +585,6 @@ func (b *LocalBackend) NetworkLockModify(addKeys, removeKeys []tka.Key) (err err
 		return nil
 	}
 
-	ourNodeKey := b.prefs.Persist().PublicNodeKey()
 	head := b.tka.authority.Head()
 	b.mu.Unlock()
 	resp, err := b.tkaDoSyncSend(ourNodeKey, head, aums, true)
@@ -553,8 +619,8 @@ func (b *LocalBackend) NetworkLockDisable(secret []byte) error {
 	)
 
 	b.mu.Lock()
-	if b.prefs.Valid() {
-		ourNodeKey = b.prefs.Persist().PublicNodeKey()
+	if p := b.pm.CurrentPrefs(); p.Valid() && p.Persist() != nil && !p.Persist().PrivateNodeKey.IsZero() {
+		ourNodeKey = p.Persist().PublicNodeKey()
 	}
 	if b.tka == nil {
 		err = errNetworkLockNotActive

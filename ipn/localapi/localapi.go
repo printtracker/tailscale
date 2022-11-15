@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -24,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -52,6 +54,7 @@ var handler = map[string]localAPIHandler{
 	"cert/":     (*Handler).serveCert,
 	"file-put/": (*Handler).serveFilePut,
 	"files/":    (*Handler).serveFiles,
+	"profiles/": (*Handler).serveProfiles,
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
 	// without a trailing slash:
@@ -71,7 +74,8 @@ var handler = map[string]localAPIHandler{
 	"metrics":                 (*Handler).serveMetrics,
 	"ping":                    (*Handler).servePing,
 	"prefs":                   (*Handler).servePrefs,
-	"profile":                 (*Handler).serveProfile,
+	"pprof":                   (*Handler).servePprof,
+	"serve-config":            (*Handler).serveServeConfig,
 	"set-dns":                 (*Handler).serveSetDNS,
 	"set-expiry-sooner":       (*Handler).serveSetExpirySooner,
 	"status":                  (*Handler).serveStatus,
@@ -79,6 +83,7 @@ var handler = map[string]localAPIHandler{
 	"tka/modify":              (*Handler).serveTKAModify,
 	"tka/sign":                (*Handler).serveTKASign,
 	"tka/status":              (*Handler).serveTKAStatus,
+	"tka/disable":             (*Handler).serveTKADisable,
 	"upload-client-metrics":   (*Handler).serveUploadClientMetrics,
 	"whois":                   (*Handler).serveWhoIs,
 }
@@ -437,22 +442,57 @@ func (h *Handler) serveComponentDebugLogging(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(res)
 }
 
-// serveProfileFunc is the implementation of Handler.serveProfile, after auth,
+// servePprofFunc is the implementation of Handler.servePprof, after auth,
 // for platforms where we want to link it in.
-var serveProfileFunc func(http.ResponseWriter, *http.Request)
+var servePprofFunc func(http.ResponseWriter, *http.Request)
 
-func (h *Handler) serveProfile(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) servePprof(w http.ResponseWriter, r *http.Request) {
 	// Require write access out of paranoia that the profile dump
 	// might contain something sensitive.
 	if !h.PermitWrite {
 		http.Error(w, "profile access denied", http.StatusForbidden)
 		return
 	}
-	if serveProfileFunc == nil {
+	if servePprofFunc == nil {
 		http.Error(w, "not implemented on this platform", http.StatusServiceUnavailable)
 		return
 	}
-	serveProfileFunc(w, r)
+	servePprofFunc(w, r)
+}
+
+func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "serve config denied", http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case "GET":
+		config := h.b.ServeConfig()
+		json.NewEncoder(w).Encode(config)
+	case "POST":
+		configIn := new(ipn.ServeConfig)
+		if err := json.NewDecoder(r.Body).Decode(configIn); err != nil {
+			json.NewEncoder(w).Encode(struct {
+				Error error
+			}{
+				Error: fmt.Errorf("decoding config: %w", err),
+			})
+			return
+		}
+		err := h.b.SetServeConfig(configIn)
+		if err != nil {
+			json.NewEncoder(w).Encode(struct {
+				Error error
+			}{
+				Error: fmt.Errorf("updating config: %w", err),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {
@@ -1035,6 +1075,113 @@ func (h *Handler) serveTKAModify(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(j)
+}
+
+func (h *Handler) serveTKADisable(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "network-lock modify access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body := io.LimitReader(r.Body, 1024*1024)
+	secret, err := ioutil.ReadAll(body)
+	if err != nil {
+		http.Error(w, "reading secret", 400)
+		return
+	}
+
+	if err := h.b.NetworkLockDisable(secret); err != nil {
+		http.Error(w, "network-lock disable failed: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(200)
+}
+
+// serveProfiles serves profile switching-related endpoints. Supported methods
+// and paths are:
+//   - GET /profiles/: list all profiles (JSON-encoded array of ipn.LoginProfiles)
+//   - PUT /profiles/: add new profile (no response). A separate
+//     StartLoginInteractive() is needed to populate and persist the new profile.
+//   - GET /profiles/current: current profile (JSON-ecoded ipn.LoginProfile)
+//   - GET /profiles/<id>: output profile (JSON-ecoded ipn.LoginProfile)
+//   - POST /profiles/<id>: switch to profile (no response)
+//   - DELETE /profiles/<id>: delete profile (no response)
+func (h *Handler) serveProfiles(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "profiles access denied", http.StatusForbidden)
+		return
+	}
+	suffix, ok := strs.CutPrefix(r.URL.EscapedPath(), "/localapi/v0/profiles/")
+	if !ok {
+		panic("misconfigured")
+	}
+	if suffix == "" {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(h.b.ListProfiles())
+		case http.MethodPut:
+			err := h.b.NewProfile()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.Error(w, "use GET or PUT", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+	suffix, err := url.PathUnescape(suffix)
+	if err != nil {
+		http.Error(w, "bad profile ID", http.StatusBadRequest)
+		return
+	}
+	if suffix == "current" {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(h.b.CurrentProfile())
+		default:
+			http.Error(w, "use GET", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	profileID := ipn.ProfileID(suffix)
+	switch r.Method {
+	case http.MethodGet:
+		profiles := h.b.ListProfiles()
+		profileIndex := slices.IndexFunc(profiles, func(p ipn.LoginProfile) bool {
+			return p.ID == profileID
+		})
+		if profileIndex == -1 {
+			http.Error(w, "Profile not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(profiles[profileIndex])
+	case http.MethodPost:
+		err := h.b.SwitchProfile(profileID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		err := h.b.DeleteProfile(profileID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "use POST or DELETE", http.StatusMethodNotAllowed)
+	}
 }
 
 func defBool(a string, def bool) bool {

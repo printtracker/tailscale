@@ -86,7 +86,8 @@ type CapabilityVersion int
 //   - 47: 2022-10-11: Register{Request,Response}.NodeKeySignature
 //   - 48: 2022-11-02: Node.UnsignedPeerAPIOnly
 //   - 49: 2022-11-03: Client understands EarlyNoise
-const CurrentCapabilityVersion CapabilityVersion = 49
+//   - 50: 2022-11-14: Client understands CapabilityIngress
+const CurrentCapabilityVersion CapabilityVersion = 50
 
 type StableID string
 
@@ -1672,6 +1673,8 @@ const (
 	CapabilityDebugPeer = "https://tailscale.com/cap/debug-peer"
 	// CapabilityWakeOnLAN grants the ability to send a Wake-On-LAN packet.
 	CapabilityWakeOnLAN = "https://tailscale.com/cap/wake-on-lan"
+	// CapabilityIngress grants the ability for a peer to send ingress traffic.
+	CapabilityIngress = "https://tailscale.com/cap/ingress"
 )
 
 // SetDNSRequest is a request to add a DNS record.

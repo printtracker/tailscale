@@ -60,6 +60,11 @@ func (k NLPrivate) MarshalText() ([]byte, error) {
 	return toHex(k.k[:], nlPrivateHexPrefix), nil
 }
 
+// Equal reports whether k and other are the same key.
+func (k NLPrivate) Equal(other NLPrivate) bool {
+	return subtle.ConstantTimeCompare(k.k[:], other.k[:]) == 1
+}
+
 // Public returns the public component of this key.
 func (k NLPrivate) Public() NLPublic {
 	var out NLPublic
@@ -98,6 +103,17 @@ func (k NLPrivate) SignNKS(sigHash tkatype.NKSSigHash) ([]byte, error) {
 // NLPublic is the public portion of a a NLPrivate.
 type NLPublic struct {
 	k [ed25519.PublicKeySize]byte
+}
+
+// NLPublicFromEd25519Unsafe converts an ed25519 public key into
+// a type of NLPublic.
+//
+// New uses of this function should be avoided, as its possible to
+// accidentally construct an NLPublic from a non network-lock key.
+func NLPublicFromEd25519Unsafe(public ed25519.PublicKey) NLPublic {
+	var out NLPublic
+	copy(out.k[:], public)
+	return out
 }
 
 // MarshalText implements encoding.TextUnmarshaler.

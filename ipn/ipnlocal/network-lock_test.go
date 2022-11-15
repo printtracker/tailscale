@@ -20,12 +20,14 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/util/must"
 )
 
 func fakeControlClient(t *testing.T, c *http.Client) *controlclient.Auto {
@@ -65,6 +67,7 @@ func fakeNoiseServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, 
 
 func TestTKAEnablementFlow(t *testing.T) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
+	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	nodePriv := key.NewNode()
 
 	// Make a fake TKA authority, getting a usable genesis AUM which
@@ -117,20 +120,26 @@ func TestTKAEnablementFlow(t *testing.T) {
 	temp := t.TempDir()
 
 	cc := fakeControlClient(t, client)
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ""))
+	must.Do(pm.SetPrefs((&ipn.Prefs{
+		Persist: &persist.Persist{
+			PrivateNodeKey: nodePriv,
+			NetworkLockKey: nlPriv,
+		},
+	}).View()))
 	b := LocalBackend{
 		varRoot: temp,
 		cc:      cc,
 		ccAuto:  cc,
 		logf:    t.Logf,
-		prefs: (&ipn.Prefs{
-			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		}).View(),
+		pm:      pm,
+		store:   pm.Store(),
 	}
 
 	err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 		TKAEnabled: true,
 		TKAHead:    a1.Head(),
-	})
+	}, pm.CurrentPrefs())
 	if err != nil {
 		t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 	}
@@ -144,15 +153,26 @@ func TestTKAEnablementFlow(t *testing.T) {
 
 func TestTKADisablementFlow(t *testing.T) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
-	temp := t.TempDir()
-	os.Mkdir(filepath.Join(temp, "tka"), 0755)
+	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	nodePriv := key.NewNode()
 
 	// Make a fake TKA authority, to seed local state.
 	disablementSecret := bytes.Repeat([]byte{0xa5}, 32)
 	nlPriv := key.NewNLPrivate()
 	key := tka.Key{Kind: tka.Key25519, Public: nlPriv.Public().Verifier(), Votes: 2}
-	chonk, err := tka.ChonkDir(filepath.Join(temp, "tka"))
+
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ""))
+	must.Do(pm.SetPrefs((&ipn.Prefs{
+		Persist: &persist.Persist{
+			PrivateNodeKey: nodePriv,
+			NetworkLockKey: nlPriv,
+		},
+	}).View()))
+
+	temp := t.TempDir()
+	tkaPath := filepath.Join(temp, "tka-profile", string(pm.CurrentProfile().ID))
+	os.Mkdir(tkaPath, 0755)
+	chonk, err := tka.ChonkDir(tkaPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,9 +239,8 @@ func TestTKADisablementFlow(t *testing.T) {
 			authority: authority,
 			storage:   chonk,
 		},
-		prefs: (&ipn.Prefs{
-			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		}).View(),
+		pm:    pm,
+		store: pm.Store(),
 	}
 
 	// Test that the wrong disablement secret does not shut down the authority.
@@ -229,7 +248,7 @@ func TestTKADisablementFlow(t *testing.T) {
 	err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 		TKAEnabled: false,
 		TKAHead:    authority.Head(),
-	})
+	}, pm.CurrentPrefs())
 	if err != nil {
 		t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 	}
@@ -242,7 +261,7 @@ func TestTKADisablementFlow(t *testing.T) {
 	err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 		TKAEnabled: false,
 		TKAHead:    authority.Head(),
-	})
+	}, pm.CurrentPrefs())
 	if err != nil {
 		t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 	}
@@ -250,13 +269,14 @@ func TestTKADisablementFlow(t *testing.T) {
 	if b.tka != nil {
 		t.Fatal("tka was not shut down")
 	}
-	if _, err := os.Stat(b.chonkPath()); err == nil || !os.IsNotExist(err) {
+	if _, err := os.Stat(b.chonkPathLocked()); err == nil || !os.IsNotExist(err) {
 		t.Errorf("os.Stat(chonkDir) = %v, want ErrNotExist", err)
 	}
 }
 
 func TestTKASync(t *testing.T) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
+	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 
 	someKeyPriv := key.NewNLPrivate()
 	someKey := tka.Key{Kind: tka.Key25519, Public: someKeyPriv.Public().Verifier(), Votes: 1}
@@ -334,10 +354,15 @@ func TestTKASync(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			temp := t.TempDir()
-			os.Mkdir(filepath.Join(temp, "tka"), 0755)
 			nodePriv := key.NewNode()
 			nlPriv := key.NewNLPrivate()
+			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ""))
+			must.Do(pm.SetPrefs((&ipn.Prefs{
+				Persist: &persist.Persist{
+					PrivateNodeKey: nodePriv,
+					NetworkLockKey: nlPriv,
+				},
+			}).View()))
 
 			// Setup the tka authority on the control plane.
 			key := tka.Key{Kind: tka.Key25519, Public: nlPriv.Public().Verifier(), Votes: 2}
@@ -355,8 +380,11 @@ func TestTKASync(t *testing.T) {
 				}
 			}
 
+			temp := t.TempDir()
+			tkaPath := filepath.Join(temp, "tka-profile", string(pm.CurrentProfile().ID))
+			os.Mkdir(tkaPath, 0755)
 			// Setup the TKA authority on the node.
-			nodeStorage, err := tka.ChonkDir(filepath.Join(temp, "tka"))
+			nodeStorage, err := tka.ChonkDir(tkaPath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -461,20 +489,19 @@ func TestTKASync(t *testing.T) {
 				cc:      cc,
 				ccAuto:  cc,
 				logf:    t.Logf,
+				pm:      pm,
+				store:   pm.Store(),
 				tka: &tkaState{
 					authority: nodeAuthority,
 					storage:   nodeStorage,
 				},
-				prefs: (&ipn.Prefs{
-					Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-				}).View(),
 			}
 
 			// Finally, lets trigger a sync.
 			err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 				TKAEnabled: true,
 				TKAHead:    controlAuthority.Head(),
-			})
+			}, pm.CurrentPrefs())
 			if err != nil {
 				t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 			}
@@ -490,6 +517,7 @@ func TestTKASync(t *testing.T) {
 
 func TestTKAFilterNetmap(t *testing.T) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
+	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 
 	nlPriv := key.NewNLPrivate()
 	nlKey := tka.Key{Kind: tka.Key25519, Public: nlPriv.Public().Verifier(), Votes: 2}
@@ -548,15 +576,26 @@ func TestTKAFilterNetmap(t *testing.T) {
 
 func TestTKADisable(t *testing.T) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
-	temp := t.TempDir()
-	os.Mkdir(filepath.Join(temp, "tka"), 0755)
+	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	nodePriv := key.NewNode()
 
 	// Make a fake TKA authority, to seed local state.
 	disablementSecret := bytes.Repeat([]byte{0xa5}, 32)
 	nlPriv := key.NewNLPrivate()
+
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ""))
+	must.Do(pm.SetPrefs((&ipn.Prefs{
+		Persist: &persist.Persist{
+			PrivateNodeKey: nodePriv,
+			NetworkLockKey: nlPriv,
+		},
+	}).View()))
+
+	temp := t.TempDir()
+	tkaPath := filepath.Join(temp, "tka-profile", string(pm.CurrentProfile().ID))
+	os.Mkdir(tkaPath, 0755)
 	key := tka.Key{Kind: tka.Key25519, Public: nlPriv.Public().Verifier(), Votes: 2}
-	chonk, err := tka.ChonkDir(filepath.Join(temp, "tka"))
+	chonk, err := tka.ChonkDir(tkaPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -613,12 +652,12 @@ func TestTKADisable(t *testing.T) {
 		ccAuto:  cc,
 		logf:    t.Logf,
 		tka: &tkaState{
+			profile:   pm.CurrentProfile().ID,
 			authority: authority,
 			storage:   chonk,
 		},
-		prefs: (&ipn.Prefs{
-			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		}).View(),
+		pm:    pm,
+		store: pm.Store(),
 	}
 
 	// Test that we get an error for an incorrect disablement secret.
@@ -632,16 +671,27 @@ func TestTKADisable(t *testing.T) {
 
 func TestTKASign(t *testing.T) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
-	temp := t.TempDir()
-	os.Mkdir(filepath.Join(temp, "tka"), 0755)
+	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	nodePriv := key.NewNode()
 	toSign := key.NewNode()
+	nlPriv := key.NewNLPrivate()
+
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ""))
+	must.Do(pm.SetPrefs((&ipn.Prefs{
+		Persist: &persist.Persist{
+			PrivateNodeKey: nodePriv,
+			NetworkLockKey: nlPriv,
+		},
+	}).View()))
 
 	// Make a fake TKA authority, to seed local state.
 	disablementSecret := bytes.Repeat([]byte{0xa5}, 32)
-	nlPriv := key.NewNLPrivate()
 	key := tka.Key{Kind: tka.Key25519, Public: nlPriv.Public().Verifier(), Votes: 2}
-	chonk, err := tka.ChonkDir(filepath.Join(temp, "tka"))
+
+	temp := t.TempDir()
+	tkaPath := filepath.Join(temp, "tka-profile", string(pm.CurrentProfile().ID))
+	os.Mkdir(tkaPath, 0755)
+	chonk, err := tka.ChonkDir(tkaPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +738,6 @@ func TestTKASign(t *testing.T) {
 		}
 	}))
 	defer ts.Close()
-
 	cc := fakeControlClient(t, client)
 	b := LocalBackend{
 		varRoot: temp,
@@ -699,10 +748,8 @@ func TestTKASign(t *testing.T) {
 			authority: authority,
 			storage:   chonk,
 		},
-		prefs: (&ipn.Prefs{
-			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		}).View(),
-		nlPrivKey: nlPriv,
+		pm:    pm,
+		store: pm.Store(),
 	}
 
 	if err := b.NetworkLockSign(toSign.Public(), nil); err != nil {

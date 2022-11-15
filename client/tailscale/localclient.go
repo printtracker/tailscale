@@ -197,6 +197,9 @@ func SetVersionMismatchHandler(f func(clientVer, serverVer string)) {
 }
 
 func (lc *LocalClient) send(ctx context.Context, method, path string, wantStatus int, body io.Reader) ([]byte, error) {
+	if jr, ok := body.(jsonReader); ok && jr.err != nil {
+		return nil, jr.err // fail early if there was a JSON marshaling error
+	}
 	req, err := http.NewRequestWithContext(ctx, method, "http://local-tailscaled.sock"+path, body)
 	if err != nil {
 		return nil, err
@@ -228,20 +231,21 @@ func WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, erro
 	return defaultLocalClient.WhoIs(ctx, remoteAddr)
 }
 
+func decodeJSON[T any](b []byte) (ret T, err error) {
+	if err := json.Unmarshal(b, &ret); err != nil {
+		var zero T
+		return zero, fmt.Errorf("failed to unmarshal JSON into %T: %w", ret, err)
+	}
+	return ret, nil
+}
+
 // WhoIs returns the owner of the remoteAddr, which must be an IP or IP:port.
 func (lc *LocalClient) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	body, err := lc.get200(ctx, "/localapi/v0/whois?addr="+url.QueryEscape(remoteAddr))
 	if err != nil {
 		return nil, err
 	}
-	r := new(apitype.WhoIsResponse)
-	if err := json.Unmarshal(body, r); err != nil {
-		if max := 200; len(body) > max {
-			body = append(body[:max], "..."...)
-		}
-		return nil, fmt.Errorf("failed to parse JSON WhoIsResponse from %q", body)
-	}
-	return r, nil
+	return decodeJSON[*apitype.WhoIsResponse](body)
 }
 
 // Goroutines returns a dump of the Tailscale daemon's current goroutines.
@@ -255,8 +259,8 @@ func (lc *LocalClient) DaemonMetrics(ctx context.Context) ([]byte, error) {
 	return lc.get200(ctx, "/localapi/v0/metrics")
 }
 
-// Profile returns a pprof profile of the Tailscale daemon.
-func (lc *LocalClient) Profile(ctx context.Context, pprofType string, sec int) ([]byte, error) {
+// Pprof returns a pprof profile of the Tailscale daemon.
+func (lc *LocalClient) Pprof(ctx context.Context, pprofType string, sec int) ([]byte, error) {
 	var secArg string
 	if sec < 0 || sec > 300 {
 		return nil, errors.New("duration out of range")
@@ -264,7 +268,7 @@ func (lc *LocalClient) Profile(ctx context.Context, pprofType string, sec int) (
 	if sec != 0 || pprofType == "profile" {
 		secArg = fmt.Sprint(sec)
 	}
-	return lc.get200(ctx, fmt.Sprintf("/localapi/v0/profile?name=%s&seconds=%v", url.QueryEscape(pprofType), secArg))
+	return lc.get200(ctx, fmt.Sprintf("/localapi/v0/pprof?name=%s&seconds=%v", url.QueryEscape(pprofType), secArg))
 }
 
 // BugReportOpts contains options to pass to the Tailscale daemon when
@@ -408,11 +412,7 @@ func (lc *LocalClient) status(ctx context.Context, queryString string) (*ipnstat
 	if err != nil {
 		return nil, err
 	}
-	st := new(ipnstate.Status)
-	if err := json.Unmarshal(body, st); err != nil {
-		return nil, err
-	}
-	return st, nil
+	return decodeJSON[*ipnstate.Status](body)
 }
 
 // IDToken is a request to get an OIDC ID token for an audience.
@@ -423,11 +423,7 @@ func (lc *LocalClient) IDToken(ctx context.Context, aud string) (*tailcfg.TokenR
 	if err != nil {
 		return nil, err
 	}
-	tr := new(tailcfg.TokenResponse)
-	if err := json.Unmarshal(body, tr); err != nil {
-		return nil, err
-	}
-	return tr, nil
+	return decodeJSON[*tailcfg.TokenResponse](body)
 }
 
 func (lc *LocalClient) WaitingFiles(ctx context.Context) ([]apitype.WaitingFile, error) {
@@ -435,11 +431,7 @@ func (lc *LocalClient) WaitingFiles(ctx context.Context) ([]apitype.WaitingFile,
 	if err != nil {
 		return nil, err
 	}
-	var wfs []apitype.WaitingFile
-	if err := json.Unmarshal(body, &wfs); err != nil {
-		return nil, err
-	}
-	return wfs, nil
+	return decodeJSON[[]apitype.WaitingFile](body)
 }
 
 func (lc *LocalClient) DeleteWaitingFile(ctx context.Context, baseName string) error {
@@ -473,11 +465,7 @@ func (lc *LocalClient) FileTargets(ctx context.Context) ([]apitype.FileTarget, e
 	if err != nil {
 		return nil, err
 	}
-	var fts []apitype.FileTarget
-	if err := json.Unmarshal(body, &fts); err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w", err)
-	}
-	return fts, nil
+	return decodeJSON[[]apitype.FileTarget](body)
 }
 
 // PushFile sends Taildrop file r to target.
@@ -531,11 +519,7 @@ func (lc *LocalClient) CheckIPForwarding(ctx context.Context) error {
 // Note that EditPrefs does the same validation as this, so call CheckPrefs before
 // EditPrefs is not necessary.
 func (lc *LocalClient) CheckPrefs(ctx context.Context, p *ipn.Prefs) error {
-	pj, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	_, err = lc.send(ctx, "POST", "/localapi/v0/check-prefs", http.StatusOK, bytes.NewReader(pj))
+	_, err := lc.send(ctx, "POST", "/localapi/v0/check-prefs", http.StatusOK, jsonBody(p))
 	return err
 }
 
@@ -552,19 +536,11 @@ func (lc *LocalClient) GetPrefs(ctx context.Context) (*ipn.Prefs, error) {
 }
 
 func (lc *LocalClient) EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error) {
-	mpj, err := json.Marshal(mp)
+	body, err := lc.send(ctx, "PATCH", "/localapi/v0/prefs", http.StatusOK, jsonBody(mp))
 	if err != nil {
 		return nil, err
 	}
-	body, err := lc.send(ctx, "PATCH", "/localapi/v0/prefs", http.StatusOK, bytes.NewReader(mpj))
-	if err != nil {
-		return nil, err
-	}
-	var p ipn.Prefs
-	if err := json.Unmarshal(body, &p); err != nil {
-		return nil, fmt.Errorf("invalid prefs JSON: %w", err)
-	}
-	return &p, nil
+	return decodeJSON[*ipn.Prefs](body)
 }
 
 func (lc *LocalClient) Logout(ctx context.Context) error {
@@ -770,11 +746,7 @@ func (lc *LocalClient) Ping(ctx context.Context, ip netip.Addr, pingtype tailcfg
 	if err != nil {
 		return nil, fmt.Errorf("error %w: %s", err, body)
 	}
-	pr := new(ipnstate.PingResult)
-	if err := json.Unmarshal(body, pr); err != nil {
-		return nil, err
-	}
-	return pr, nil
+	return decodeJSON[*ipnstate.PingResult](body)
 }
 
 // NetworkLockStatus fetches information about the tailnet key authority, if one is configured.
@@ -783,11 +755,7 @@ func (lc *LocalClient) NetworkLockStatus(ctx context.Context) (*ipnstate.Network
 	if err != nil {
 		return nil, fmt.Errorf("error: %w", err)
 	}
-	pr := new(ipnstate.NetworkLockStatus)
-	if err := json.Unmarshal(body, pr); err != nil {
-		return nil, err
-	}
-	return pr, nil
+	return decodeJSON[*ipnstate.NetworkLockStatus](body)
 }
 
 // NetworkLockInit initializes the tailnet key authority.
@@ -808,12 +776,7 @@ func (lc *LocalClient) NetworkLockInit(ctx context.Context, keys []tka.Key, disa
 	if err != nil {
 		return nil, fmt.Errorf("error: %w", err)
 	}
-
-	pr := new(ipnstate.NetworkLockStatus)
-	if err := json.Unmarshal(body, pr); err != nil {
-		return nil, err
-	}
-	return pr, nil
+	return decodeJSON[*ipnstate.NetworkLockStatus](body)
 }
 
 // NetworkLockModify adds and/or removes key(s) to the tailnet key authority.
@@ -832,12 +795,7 @@ func (lc *LocalClient) NetworkLockModify(ctx context.Context, addKeys, removeKey
 	if err != nil {
 		return nil, fmt.Errorf("error: %w", err)
 	}
-
-	pr := new(ipnstate.NetworkLockStatus)
-	if err := json.Unmarshal(body, pr); err != nil {
-		return nil, err
-	}
-	return pr, nil
+	return decodeJSON[*ipnstate.NetworkLockStatus](body)
 }
 
 // NetworkLockSign signs the specified node-key and transmits that signature to the control plane.
@@ -857,6 +815,42 @@ func (lc *LocalClient) NetworkLockSign(ctx context.Context, nodeKey key.NodePubl
 		return fmt.Errorf("error: %w", err)
 	}
 	return nil
+}
+
+// SetServeConfig sets or replaces the serving settings.
+// If config is nil, settings are cleared and serving is disabled.
+func (lc *LocalClient) SetServeConfig(ctx context.Context, config *ipn.ServeConfig) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/serve-config", 200, jsonBody(config))
+	if err != nil {
+		return fmt.Errorf("sending serve config: %w", err)
+	}
+	return nil
+}
+
+// NetworkLockDisable shuts down network-lock across the tailnet.
+func (lc *LocalClient) NetworkLockDisable(ctx context.Context, secret []byte) error {
+	if _, err := lc.send(ctx, "POST", "/localapi/v0/tka/disable", 200, bytes.NewReader(secret)); err != nil {
+		return fmt.Errorf("error: %w", err)
+	}
+	return nil
+}
+
+// GetServeConfig return the current serve config.
+//
+// If the serve config is empty, it returns (nil, nil).
+func (lc *LocalClient) GetServeConfig(ctx context.Context) (*ipn.ServeConfig, error) {
+	body, err := lc.send(ctx, "GET", "/localapi/v0/serve-config", 200, nil)
+	if err != nil {
+		return nil, fmt.Errorf("getting serve config: %w", err)
+	}
+	return getServeConfigFromJSON(body)
+}
+
+func getServeConfigFromJSON(body []byte) (sc *ipn.ServeConfig, err error) {
+	if err := json.Unmarshal(body, &sc); err != nil {
+		return nil, err
+	}
+	return sc, nil
 }
 
 // tailscaledConnectHint gives a little thing about why tailscaled (or
@@ -887,4 +881,25 @@ func tailscaledConnectHint() string {
 		return "systemd tailscaled.service not running."
 	}
 	return "not running?"
+}
+
+type jsonReader struct {
+	b   *bytes.Reader
+	err error // sticky JSON marshal error, if any
+}
+
+// jsonBody returns an io.Reader that marshals v as JSON and then reads it.
+func jsonBody(v any) jsonReader {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return jsonReader{err: err}
+	}
+	return jsonReader{b: bytes.NewReader(b)}
+}
+
+func (r jsonReader) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	return r.b.Read(p)
 }

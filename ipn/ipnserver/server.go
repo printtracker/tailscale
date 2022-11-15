@@ -42,7 +42,6 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
-	"tailscale.com/tka"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/groupmember"
 	"tailscale.com/util/pidowner"
@@ -101,8 +100,7 @@ type Server struct {
 	// being run in "client mode" that requires an active GUI
 	// connection (such as on Windows by default).  Even if this
 	// is true, the ForceDaemon pref can override this.
-	resetOnZero       bool
-	autostartStateKey ipn.StateKey
+	resetOnZero bool
 
 	bsMu sync.Mutex // lock order: bsMu, then mu
 	bs   *ipn.BackendServer
@@ -685,26 +683,6 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 	}()
 	logf("Listening on %v", ln.Addr())
 
-	var serverModeUser *user.User
-	if opts.AutostartStateKey == "" {
-		autoStartKey, err := store.ReadState(ipn.ServerModeStartKey)
-		if err != nil && err != ipn.ErrStateNotExist {
-			return fmt.Errorf("calling ReadState on state store: %w", err)
-		}
-		key := string(autoStartKey)
-		if strings.HasPrefix(key, "user-") {
-			uid := strings.TrimPrefix(key, "user-")
-			u, err := lookupUserFromID(logf, uid)
-			if err != nil {
-				logf("ipnserver: found server mode auto-start key %q; failed to load user: %v", key, err)
-			} else {
-				logf("ipnserver: found server mode auto-start key %q (user %s)", key, u.Username)
-				serverModeUser = u
-			}
-			opts.AutostartStateKey = ipn.StateKey(key)
-		}
-	}
-
 	bo := backoff.NewBackoff("ipnserver", logf, 30*time.Second)
 	var unservedConn net.Conn // if non-nil, accepted, but hasn't served yet
 
@@ -745,7 +723,7 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 		}
 	}
 
-	server, err := New(logf, logid, store, eng, dialer, serverModeUser, opts)
+	server, err := New(logf, logid, store, eng, dialer, opts)
 	if err != nil {
 		return err
 	}
@@ -761,8 +739,8 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 // New returns a new Server.
 //
 // To start it, use the Server.Run method.
-func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engine, dialer *tsdial.Dialer, serverModeUser *user.User, opts Options) (*Server, error) {
-	b, err := ipnlocal.NewLocalBackend(logf, logid, store, dialer, eng, opts.LoginFlags)
+func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engine, dialer *tsdial.Dialer, opts Options) (*Server, error) {
+	b, err := ipnlocal.NewLocalBackend(logf, logid, store, opts.AutostartStateKey, dialer, eng, opts.LoginFlags)
 	if err != nil {
 		return nil, fmt.Errorf("NewLocalBackend: %v", err)
 	}
@@ -772,24 +750,7 @@ func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engi
 	})
 
 	if root := b.TailscaleVarRoot(); root != "" {
-		chonkDir := filepath.Join(root, "tka")
-		if _, err := os.Stat(chonkDir); err == nil {
-			// The directory exists, which means network-lock has been initialized.
-			storage, err := tka.ChonkDir(chonkDir)
-			if err != nil {
-				return nil, fmt.Errorf("opening tailchonk: %v", err)
-			}
-			authority, err := tka.Open(storage)
-			if err != nil {
-				return nil, fmt.Errorf("initializing tka: %v", err)
-			}
-			b.SetTailnetKeyAuthority(authority, storage)
-			logf("tka initialized at head %x", authority.Head())
-		}
-
 		dnsfallback.SetCachePath(filepath.Join(root, "derpmap.cached.json"))
-	} else {
-		logf("network-lock unavailable; no state directory")
 	}
 
 	dg := distro.Get()
@@ -808,32 +769,23 @@ func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engi
 
 	}
 
-	if opts.AutostartStateKey == "" {
-		autoStartKey, err := store.ReadState(ipn.ServerModeStartKey)
-		if err != nil && err != ipn.ErrStateNotExist {
-			return nil, fmt.Errorf("calling ReadState on store: %w", err)
-		}
-		key := string(autoStartKey)
-		if strings.HasPrefix(key, "user-") {
-			uid := strings.TrimPrefix(key, "user-")
-			u, err := lookupUserFromID(logf, uid)
-			if err != nil {
-				logf("ipnserver: found server mode auto-start key %q; failed to load user: %v", key, err)
-			} else {
-				logf("ipnserver: found server mode auto-start key %q (user %s)", key, u.Username)
-				serverModeUser = u
-			}
-			opts.AutostartStateKey = ipn.StateKey(key)
+	var serverModeUser *user.User
+	if uid := b.CurrentUser(); uid != "" {
+		u, err := lookupUserFromID(logf, uid)
+		if err != nil {
+			logf("ipnserver: found server mode auto-start key; failed to load user: %v", err)
+		} else {
+			logf("ipnserver: found server mode auto-start key (user %s)", u.Username)
+			serverModeUser = u
 		}
 	}
 
 	server := &Server{
-		b:                 b,
-		backendLogID:      logid,
-		logf:              logf,
-		resetOnZero:       !opts.SurviveDisconnects,
-		serverModeUser:    serverModeUser,
-		autostartStateKey: opts.AutostartStateKey,
+		b:              b,
+		backendLogID:   logid,
+		logf:           logf,
+		resetOnZero:    !opts.SurviveDisconnects,
+		serverModeUser: serverModeUser,
 	}
 	server.bs = ipn.NewBackendServer(logf, b, server.writeToClients)
 	return server, nil
@@ -859,11 +811,11 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 		ln.Close()
 	}()
 
-	if s.autostartStateKey != "" {
+	if s.b.Prefs().Valid() {
 		s.bs.GotCommand(ctx, &ipn.Command{
 			Version: version.Long,
 			Start: &ipn.StartArgs{
-				Opts: ipn.Options{StateKey: s.autostartStateKey},
+				Opts: ipn.Options{},
 			},
 		})
 	}

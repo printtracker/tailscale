@@ -31,6 +31,7 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
 	"tailscale.com/safesocket"
@@ -513,6 +514,7 @@ func TestLogoutRemovesAllPeers(t *testing.T) {
 		nodes[i].AwaitIP()
 		nodes[i].AwaitRunning()
 	}
+	expectedPeers := len(nodes) - 1
 
 	// Make every node ping every other node.
 	// This makes sure magicsock is fully populated.
@@ -542,12 +544,15 @@ func TestLogoutRemovesAllPeers(t *testing.T) {
 		}
 	}
 
-	wantNode0PeerCount(len(nodes) - 1) // all other nodes are peers
+	wantNode0PeerCount(expectedPeers) // all other nodes are peers
 	nodes[0].MustLogOut()
 	wantNode0PeerCount(0) // node[0] is logged out, so it should not have any peers
-	nodes[0].MustUp()
+
+	nodes[0].MustUp() // This will create a new node
+	expectedPeers++
+
 	nodes[0].AwaitIP()
-	wantNode0PeerCount(len(nodes) - 1) // all other nodes are peers again
+	wantNode0PeerCount(expectedPeers) // all existing peers and the new node
 }
 
 // testEnv contains the test environment (set of servers) used by one
@@ -659,15 +664,11 @@ func (n *testNode) diskPrefs() *ipn.Prefs {
 	if err != nil {
 		t.Fatalf("reading prefs, NewFileStore: %v", err)
 	}
-	prefBytes, err := fs.ReadState(ipn.GlobalDaemonStateKey)
+	p, err := ipnlocal.ReadStartupPrefsForTest(t.Logf, fs)
 	if err != nil {
-		t.Fatalf("reading prefs, ReadState: %v", err)
+		t.Fatalf("reading prefs, ReadDiskPrefsForTest: %v", err)
 	}
-	p := new(ipn.Prefs)
-	if err := json.Unmarshal(prefBytes, p); err != nil {
-		t.Fatalf("reading prefs, JSON unmarshal: %v", err)
-	}
-	return p
+	return p.AsStruct()
 }
 
 // AwaitResponding waits for n's tailscaled to be up enough to be
