@@ -539,8 +539,6 @@ func (s *Server) start() (reterr error) {
 	sys.Set(ns)
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
-	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
-	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		_, ok := eng.PeerForIP(ip)
